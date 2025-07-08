@@ -1,0 +1,164 @@
+import pandas as pd
+import numpy as np
+import os
+import pickle
+import socket
+from sqlalchemy import create_engine
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import credentials
+
+
+
+
+# PostgreSQL connection string
+PG_CONNECTION_STRING = credentials.PG_CONNECTION_STRING
+engine = create_engine(PG_CONNECTION_STRING)
+
+# Google Sheets API setup
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SERVICE_ACCOUNT_FILE = 'credentials.json'
+SPREADSHEET_ID = credentials.SPREADSHEET_ID
+
+TABLE_SHEET_MAP = {
+    'cpu_cstate_rates': 'CPU C-State Rates - Daily Avg',
+    'disk_iops': 'Disk IOPS - Daily Avg',
+    'disk_throughput': 'Disk Throughput - Daily Avg',
+    'ram_stats': 'RAM Stats - Daily Avg',
+    'disk_free_space': 'Disk Free Space - Daily Avg',
+    'bandwidth': 'Bandwidth - Daily Avg'
+}
+
+def authenticate():
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(SERVICE_ACCOUNT_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    return creds
+
+def build_sheets_service():
+    creds = authenticate()
+    return build('sheets', 'v4', credentials=creds)
+
+def recreate_sheet(service, sheet_name):
+    spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    existing_sheets = [s['properties'] for s in spreadsheet.get('sheets', [])]
+    existing_titles = [s['title'] for s in [s['properties'] for s in spreadsheet.get('sheets', [])]]
+
+    if sheet_name in existing_titles:
+        sheet_id = next((s['sheetId'] for s in existing_sheets if s['title'] == sheet_name), None)
+        if sheet_id is not None:
+            service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={
+                "requests": [{"deleteSheet": {"sheetId": sheet_id}}]
+            }).execute()
+    service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={
+        "requests": [{"addSheet": {"properties": {"title": sheet_name}}}]
+    }).execute()
+
+def dataframe_to_sheets_values(df):
+    values = [df.columns.tolist()]
+    for _, row in df.iterrows():
+        values.append([str(x) if isinstance(x, pd.Timestamp) else x for x in row])
+    return values
+
+def truncate_timestamp_to_day(df):
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df['date'] = df['timestamp'].dt.date
+    return df
+
+def process_cpu_utilization(df):
+    df = truncate_timestamp_to_day(df)
+    if not {'timestamp', 'state', 'rate_per_sec'}.issubset(df.columns):
+        return pd.DataFrame()
+
+    total = df.groupby(['timestamp'])['rate_per_sec'].sum().rename('total')
+    idle = df[df['state'].isin(['idle', 'iowait'])].groupby('timestamp')['rate_per_sec'].sum().rename('idle')
+    merged = pd.concat([total, idle], axis=1).fillna(0)
+    merged['cpu_util_percent'] = (100 * (1 - merged['idle'] / merged['total'])).clip(0, 100)
+    merged.reset_index(inplace=True)
+    merged['date'] = merged['timestamp'].dt.date
+    daily_avg = merged.groupby('date')['cpu_util_percent'].mean().reset_index()
+    return daily_avg
+
+def process_disk_iops(df):
+    df = truncate_timestamp_to_day(df)
+    if not {'read_iops', 'write_iops'}.issubset(df.columns):
+        return pd.DataFrame()
+    df['iops'] = df['read_iops'] + df['write_iops']
+    return df.groupby('date')['iops'].mean().reset_index()
+
+def process_disk_throughput(df):
+    df = truncate_timestamp_to_day(df)
+    if not {'read_bytes_per_sec', 'write_bytes_per_sec'}.issubset(df.columns):
+        return pd.DataFrame()
+    df['total_throughput'] = df['read_bytes_per_sec'] + df['write_bytes_per_sec']
+    df['throughput_mbps'] = df['total_throughput'] * 8 / (1024 ** 2)
+    return df.groupby('date')['throughput_mbps'].mean().reset_index()
+
+def process_ram_stats(df):
+    df = truncate_timestamp_to_day(df)
+    if 'bytes' not in df.columns:
+        return pd.DataFrame()
+    df['bytes_gb'] = df['bytes'] / (1024 ** 3)
+    return df.groupby('date')['bytes_gb'].mean().reset_index()
+
+def process_disk_space(df):
+    df = truncate_timestamp_to_day(df)
+    if 'bytes' not in df.columns:
+        return pd.DataFrame()
+    df['bytes_gb'] = df['bytes'] / (1024 ** 3)
+    return df.groupby('date')['bytes_gb'].mean().reset_index()
+
+def process_bandwidth(df):
+    df = truncate_timestamp_to_day(df)
+    if 'value' not in df.columns:
+        return pd.DataFrame()
+    df['value_mbps'] = df['value'] * 8 / (1024 ** 2)
+    return df.groupby('date')['value_mbps'].mean().reset_index()
+
+def main():
+    local_ip = socket.gethostbyname(socket.gethostname())
+    service = build_sheets_service()
+
+    processors = {
+        'cpu_cstate_rates': process_cpu_utilization,
+        'disk_iops': process_disk_iops,
+        'disk_throughput': process_disk_throughput,
+        'ram_stats': process_ram_stats,
+        'disk_free_space': process_disk_space,
+        'bandwidth': process_bandwidth
+    }
+
+    for table, sheet_name in TABLE_SHEET_MAP.items():
+        try:
+            df = pd.read_sql(f"SELECT * FROM {table};", engine)
+            if df.empty:
+                continue
+            df['ip'] = local_ip
+            processed = processors[table](df)
+            if processed.empty:
+                continue
+            processed['date'] = processed['date'].astype(str)
+            recreate_sheet(service, sheet_name)
+            values = dataframe_to_sheets_values(processed)
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{sheet_name}'!A1",
+                valueInputOption='USER_ENTERED',
+                body={'values': values}
+            ).execute()
+            print(f"✅ Updated sheet: {sheet_name}")
+        except Exception as e:
+            print(f"❌ Error processing {table}: {e}")
+
+main()
